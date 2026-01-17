@@ -1,4 +1,4 @@
-# Daily Ramdom Circuit
+# Daily Random Circuit
 
 Every day, GitHub Actions generates a **random dynamical system**
 and excites it with a **random input signal**.
