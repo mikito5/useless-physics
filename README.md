@@ -5,13 +5,13 @@ and excites it with a **random input signal**.
 
 ## Today's Result (2026-01-17)
 
-- **System**: RL
-- **Parameters**: R=0.81, L=3.03, τ=3.73
-- **Input**: impulse (area≈1.32)
+- **System**: RC
+- **Parameters**: R=3.23, C=2.38, τ=7.67
+- **Input**: impulse (area≈1.38)
 
 ### Useless judgement
 - **verdict**: **feral**（だいぶ暴れた）
-- overshoot-ish: 1.359
+- overshoot-ish: 1.264
 - wiggles: 1
 - FFT peak: 0.100 (arb.)
 
