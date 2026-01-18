@@ -9,19 +9,18 @@ rng = np.random.default_rng()
 
 # ================== Simulation time ==================
 T = 10.0
-N = 4096  # FFTしやすいように少し大きめ
-t = np.linspace(0, T, N)
+N = 4096  # FFTしやすい
+t = np.linspace(0, T, N, endpoint=False)
 dt = t[1] - t[0]
-fs = 1.0 / dt  # [1/s] (tの単位が"秒"という建て付け)
+fs = 1.0 / dt
 
-# ================== Discrete component values (1) ==================
-# “イメージしやすい値”だけを候補にする
+# ================== Discrete component values ==================
 R_VALUES = np.array([0.5, 1.0, 2.0, 5.0, 10.0])
 L_VALUES = np.array([0.5, 1.0, 2.0, 5.0, 10.0])
 C_VALUES = np.array([0.1, 0.2, 0.5, 1.0, 2.0, 5.0])
 
 # ================== Input signals ==================
-def make_input(kind, t):
+def make_input(kind, t, dt):
     A = rng.uniform(0.8, 1.5)
     x = np.zeros_like(t)
 
@@ -57,37 +56,136 @@ def make_input(kind, t):
     return x, desc
 
 input_kind = rng.choice(["step", "impulse", "sine", "square", "ramp", "noise"])
-x, x_desc = make_input(input_kind, t)
+x, x_desc = make_input(input_kind, t, dt)
 
-# ================== System selection ==================
-system = rng.choice(["RC", "RL", "RLC"])
+# ================== Filters: low/high/band/notch ==================
+FILTER_KIND = rng.choice(["low", "high", "band", "notch"])
 
-# ---------- RC / RL: 1st order low-pass form ----------
-def first_order_response(x, tau, dt):
+# ================== Helpers ==================
+def first_order_lowpass(x, tau, dt):
+    """y[n] = a y[n-1] + (1-a) x[n]"""
     y = np.zeros_like(x)
+    tau = max(tau, 1e-9)
     a = np.exp(-dt / tau)
     b = 1.0 - a
     for n in range(1, len(x)):
         y[n] = a * y[n - 1] + b * x[n]
     return y
 
-# ---------- Simulate ----------
+def bilinear_biquad_from_analog(num_s, den_s, dt):
+    """
+    Analog H(s) = (b0 s^2 + b1 s + b2) / (a0 s^2 + a1 s + a2)
+    Bilinear: s = K * (1 - z^-1)/(1 + z^-1), K=2/dt
+    Returns digital b=[b0,b1,b2], a=[1,a1,a2] for:
+      y[n] = b0 x[n] + b1 x[n-1] + b2 x[n-2] - a1 y[n-1] - a2 y[n-2]
+    """
+    b0, b1, b2 = num_s
+    a0, a1, a2 = den_s
+    K = 2.0 / dt
+
+    # Polynomials in z^-1
+    p = np.array([1.0, -1.0])  # (1 - z^-1)
+    q = np.array([1.0,  1.0])  # (1 + z^-1)
+
+    p2 = np.convolve(p, p)     # (1 - z^-1)^2
+    q2 = np.convolve(q, q)     # (1 + z^-1)^2
+    pq = np.convolve(p, q)     # (1 - z^-1)(1 + z^-1) = 1 - z^-2
+
+    # Multiply numerator/denominator by q^2 to clear fractions:
+    # Num = b0 K^2 p^2 + b1 K p q + b2 q^2
+    # Den = a0 K^2 p^2 + a1 K p q + a2 q^2
+    B = (b0 * (K**2)) * p2 + (b1 * K) * pq + b2 * q2
+    A = (a0 * (K**2)) * p2 + (a1 * K) * pq + a2 * q2
+
+    # Normalize so A[0] = 1
+    if abs(A[0]) < 1e-18:
+        A[0] = 1e-18
+    B = B / A[0]
+    A = A / A[0]
+
+    # A should be [1, a1, a2] in z^-1 domain
+    return B, A
+
+def biquad_filter(x, b, a):
+    """Direct Form I biquad, a[0]=1 assumed."""
+    y = np.zeros_like(x)
+    b0, b1, b2 = b
+    _, a1, a2 = a
+
+    x1 = x2 = 0.0
+    y1 = y2 = 0.0
+    for n in range(len(x)):
+        x0 = float(x[n])
+        y0 = b0*x0 + b1*x1 + b2*x2 - a1*y1 - a2*y2
+        y[n] = y0
+        x2, x1 = x1, x0
+        y2, y1 = y1, y0
+    return y
+
+def rlc_analog_tf(kind, wn, zeta):
+    """
+    Standard 2nd-order denominator: s^2 + 2ζωn s + ωn^2
+    Provide numerator for each response shape:
+      low:   ωn^2
+      high:  s^2
+      band:  2ζωn s
+      notch: s^2 + ωn^2
+    Return (num_s, den_s) as [b0,b1,b2], [a0,a1,a2] for b0 s^2 + b1 s + b2
+    """
+    den_s = [1.0, 2.0*zeta*wn, wn**2]
+
+    if kind == "low":
+        num_s = [0.0, 0.0, wn**2]
+    elif kind == "high":
+        num_s = [1.0, 0.0, 0.0]
+    elif kind == "band":
+        num_s = [0.0, 2.0*zeta*wn, 0.0]
+    elif kind == "notch":
+        num_s = [1.0, 0.0, wn**2]
+    else:
+        raise ValueError("unknown kind")
+    return num_s, den_s
+
+# ================== System selection ==================
+# band/notch は2次が必要なので、そこだけはRLCに寄せる
+if FILTER_KIND in ["band", "notch"]:
+    system = "RLC"
+else:
+    system = rng.choice(["RC", "RL", "RLC"])
+
+# ================== Simulate ==================
 if system == "RC":
     R = float(rng.choice(R_VALUES))
     C = float(rng.choice(C_VALUES))
     tau = R * C
-    y = first_order_response(x, tau, dt)
-    params = f"R={R:.2f}, C={C:.2f}, τ={tau:.2f}"
+
+    y_lp = first_order_lowpass(x, tau, dt)
+    if FILTER_KIND == "low":
+        y = y_lp
+        fdesc = "lowpass"
+    else:
+        y = x - y_lp
+        fdesc = "highpass"
+
+    params = f"R={R:.2f}, C={C:.2f}, τ={tau:.2f}, {fdesc}"
 
 elif system == "RL":
     R = float(rng.choice(R_VALUES))
     L = float(rng.choice(L_VALUES))
-    tau = L / R
-    y = first_order_response(x, tau, dt)
-    params = f"R={R:.2f}, L={L:.2f}, τ={tau:.2f}"
+    tau = L / max(R, 1e-12)
+
+    y_lp = first_order_lowpass(x, tau, dt)
+    if FILTER_KIND == "low":
+        y = y_lp
+        fdesc = "lowpass"
+    else:
+        y = x - y_lp
+        fdesc = "highpass"
+
+    params = f"R={R:.2f}, L={L:.2f}, τ={tau:.2f}, {fdesc}"
 
 else:
-    # Standard 2nd order form: y'' + 2ζωn y' + ωn^2 y = ωn^2 x
+    # 2nd order via analog TF + bilinear transform -> digital biquad
     R = float(rng.choice(R_VALUES))
     L = float(rng.choice(L_VALUES))
     C = float(rng.choice(C_VALUES))
@@ -95,32 +193,31 @@ else:
     wn = 1.0 / np.sqrt(L * C)
     zeta = (R / 2.0) * np.sqrt(C / L)
 
-    y = np.zeros_like(x)
-    yd = np.zeros_like(x)  # y'
-    for n in range(1, len(x)):
-        ydd = (wn ** 2) * (x[n] - y[n - 1]) - (2 * zeta * wn) * yd[n - 1]
-        yd[n] = yd[n - 1] + dt * ydd
-        y[n] = y[n - 1] + dt * yd[n]
+    # Ensure stable analog (zeta>0). (It always is here.)
+    zeta = max(zeta, 1e-6)
 
-    params = f"R={R:.2f}, L={L:.2f}, C={C:.2f}, ωn={wn:.2f}, ζ={zeta:.2f}"
+    # Choose actual kind for RLC (all 4 allowed)
+    kind = FILTER_KIND  # low/high/band/notch
 
-# ================== 1) “Judgement” (meaningless but consistent) ==================
-# Normalize for analysis stability
+    num_s, den_s = rlc_analog_tf(kind, wn, zeta)
+    b, a = bilinear_biquad_from_analog(num_s, den_s, dt)
+    y = biquad_filter(x, b, a)
+
+    params = f"R={R:.2f}, L={L:.2f}, C={C:.2f}, ωn={wn:.2f}, ζ={zeta:.2f}, {kind}pass" if kind in ["low","high"] else f"R={R:.2f}, L={L:.2f}, C={C:.2f}, ωn={wn:.2f}, ζ={zeta:.2f}, {kind}"
+
+# ================== 1) “Judgement” ==================
 y_center = y - np.mean(y)
 y_scale = np.max(np.abs(y_center)) + 1e-12
 y_norm = y_center / y_scale
 
-# Overshoot-ish metric (peak compared to final-ish level)
 tail = y_norm[int(0.9 * len(y_norm)):]
 final_level = np.mean(tail)
 peak = np.max(y_norm)
 overshoot = float(peak - final_level)
 
-# Oscillation metric: count sign changes of derivative (rough “wiggle count”)
 dy = np.diff(y_norm)
-wiggles = int(np.sum((dy[:-1] * dy[1:]) < 0))  # derivative sign changes
+wiggles = int(np.sum((dy[:-1] * dy[1:]) < 0))
 
-# “Stability” score (completely arbitrary but repeatable)
 score = 0.7 * abs(overshoot) + 0.3 * (wiggles / 50.0)
 
 if score < 0.25:
@@ -131,7 +228,6 @@ else:
     verdict = "feral"
 
 # ================== 2) FFT plot (input + output) ==================
-# Center signals (remove DC), window for nicer spectrum
 x_center = x - np.mean(x)
 y_center = y - np.mean(y)
 
@@ -144,7 +240,6 @@ freq = np.fft.rfftfreq(len(y_center), d=dt)
 magX = np.abs(X)
 magY = np.abs(Y)
 
-# Avoid DC dominating
 magX[0] = 0.0
 magY[0] = 0.0
 
@@ -153,10 +248,23 @@ freqp = freq[mask]
 magXp = magX[mask]
 magYp = magY[mask]
 
-# Peak of output spectrum (on positive freqs)
 peak_k = int(np.argmax(magYp))
 peak_f = float(freqp[peak_k])
 peak_mag = float(magYp[peak_k])
+
+# Optional: auto "shape" guess from |Y|/|X|
+eps = 1e-12
+H = magYp / (magXp + eps)
+split = np.median(freqp)
+low_med = float(np.median(H[freqp < split])) if np.any(freqp < split) else float(np.median(H))
+high_med = float(np.median(H[freqp >= split])) if np.any(freqp >= split) else float(np.median(H))
+lp_score = low_med / (high_med + eps)
+if lp_score > 1.2:
+    shape_guess = "low-ish"
+elif lp_score < 1/1.2:
+    shape_guess = "high-ish"
+else:
+    shape_guess = "band/flat-ish"
 
 # ================== 3) English one-liner ==================
 one_liners = {
@@ -181,7 +289,6 @@ line = rng.choice(one_liners[verdict])
 # ================== Plot (time + FFT) ==================
 plt.figure(figsize=(9, 7))
 
-# Top: time domain
 ax1 = plt.subplot(2, 1, 1)
 ax1.plot(t, x, label="input")
 ax1.plot(t, y, label="output")
@@ -189,25 +296,23 @@ ax1.set_xlabel("t [arb.]")
 ax1.set_ylabel("[arb.]")
 ax1.set_title(
     f"Daily Useless {system} ({today}) | verdict: {verdict}\n"
-    f"Input: {input_kind}, {x_desc} | {params}"
+    f"Filter: {FILTER_KIND} | Input: {input_kind}, {x_desc} | {params}"
 )
 ax1.legend()
 ax1.grid(True, alpha=0.25)
 
-# Bottom: spectrum (log-log)  ※xlimは “正の範囲” を指定するのが安全
 ax2 = plt.subplot(2, 1, 2)
 ax2.plot(freqp, magXp, label="input FFT", alpha=0.6)
 ax2.plot(freqp, magYp, label="output FFT")
 ax2.set_xscale("log")
 ax2.set_yscale("log")
 
-# 見やすさ優先で低周波側だけ（ただし log なので左端は >0 ）
 xmax = min(np.max(freqp), 10.0)
 ax2.set_xlim(freqp[0], xmax)
 
 ax2.set_xlabel("frequency [arb.]")
 ax2.set_ylabel("|FFT(.)|")
-ax2.set_title(f"Output FFT peak ≈ {peak_f:.3f} (arb.), magnitude ≈ {peak_mag:.3e}")
+ax2.set_title(f"Output FFT peak ≈ {peak_f:.3f} (arb.), magnitude ≈ {peak_mag:.3e} | {shape_guess}")
 ax2.grid(True, alpha=0.25)
 ax2.legend()
 
@@ -224,6 +329,7 @@ and excites it with a **random input signal**.
 ## Today's Result ({today})
 
 - **System**: {system}
+- **Filter kind (random)**: {FILTER_KIND}
 - **Parameters**: {params}
 - **Input**: {x_desc}
 
@@ -232,12 +338,11 @@ and excites it with a **random input signal**.
 - overshoot-ish: {overshoot:.3f}
 - wiggles: {wiggles}
 - FFT peak (output): {peak_f:.3f} (arb.)
+- rough shape guess from |Y|/|X|: {shape_guess}
 
 > {line}
 
 ![result](result.svg)
-
 """
 with open("README.md", "w", encoding="utf-8") as f:
     f.write(readme)
-
