@@ -188,7 +188,7 @@ ax1.plot(t, y, label="output")
 ax1.set_xlabel("t [arb.]")
 ax1.set_ylabel("[arb.]")
 ax1.set_title(
-    f"Daily Useless {system} ({today}) | verdict: {verdict} ({verdict_jp})\n"
+    f"Daily Useless {system} ({today}) | verdict: {verdict}\n"
     f"Input: {input_kind}, {x_desc} | {params}"
 )
 ax1.legend()
