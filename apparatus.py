@@ -58,79 +58,25 @@ def make_input(kind, t, dt):
 input_kind = rng.choice(["step", "impulse", "sine", "square", "ramp", "noise"])
 x, x_desc = make_input(input_kind, t, dt)
 
-# ================== Filters: low/high/band/notch ==================
-FILTER_KIND = rng.choice(["low", "high", "band", "notch"])
-
-# ================== Helpers ==================
+# ================== Core filters ==================
 def first_order_lowpass(x, tau, dt):
     """y[n] = a y[n-1] + (1-a) x[n]"""
     y = np.zeros_like(x)
-    tau = max(tau, 1e-9)
+    tau = max(float(tau), 1e-9)
     a = np.exp(-dt / tau)
     b = 1.0 - a
     for n in range(1, len(x)):
         y[n] = a * y[n - 1] + b * x[n]
     return y
 
-def bilinear_biquad_from_analog(num_s, den_s, dt):
-    """
-    Analog H(s) = (b0 s^2 + b1 s + b2) / (a0 s^2 + a1 s + a2)
-    Bilinear: s = K * (1 - z^-1)/(1 + z^-1), K=2/dt
-    Returns digital b=[b0,b1,b2], a=[1,a1,a2] for:
-      y[n] = b0 x[n] + b1 x[n-1] + b2 x[n-2] - a1 y[n-1] - a2 y[n-2]
-    """
-    b0, b1, b2 = num_s
-    a0, a1, a2 = den_s
-    K = 2.0 / dt
-
-    # Polynomials in z^-1
-    p = np.array([1.0, -1.0])  # (1 - z^-1)
-    q = np.array([1.0,  1.0])  # (1 + z^-1)
-
-    p2 = np.convolve(p, p)     # (1 - z^-1)^2
-    q2 = np.convolve(q, q)     # (1 + z^-1)^2
-    pq = np.convolve(p, q)     # (1 - z^-1)(1 + z^-1) = 1 - z^-2
-
-    # Multiply numerator/denominator by q^2 to clear fractions:
-    # Num = b0 K^2 p^2 + b1 K p q + b2 q^2
-    # Den = a0 K^2 p^2 + a1 K p q + a2 q^2
-    B = (b0 * (K**2)) * p2 + (b1 * K) * pq + b2 * q2
-    A = (a0 * (K**2)) * p2 + (a1 * K) * pq + a2 * q2
-
-    # Normalize so A[0] = 1
-    if abs(A[0]) < 1e-18:
-        A[0] = 1e-18
-    B = B / A[0]
-    A = A / A[0]
-
-    # A should be [1, a1, a2] in z^-1 domain
-    return B, A
-
-def biquad_filter(x, b, a):
-    """Direct Form I biquad, a[0]=1 assumed."""
-    y = np.zeros_like(x)
-    b0, b1, b2 = b
-    _, a1, a2 = a
-
-    x1 = x2 = 0.0
-    y1 = y2 = 0.0
-    for n in range(len(x)):
-        x0 = float(x[n])
-        y0 = b0*x0 + b1*x1 + b2*x2 - a1*y1 - a2*y2
-        y[n] = y0
-        x2, x1 = x1, x0
-        y2, y1 = y1, y0
-    return y
-
 def rlc_analog_tf(kind, wn, zeta):
     """
-    Standard 2nd-order denominator: s^2 + 2ζωn s + ωn^2
-    Provide numerator for each response shape:
-      low:   ωn^2
-      high:  s^2
-      band:  2ζωn s
-      notch: s^2 + ωn^2
-    Return (num_s, den_s) as [b0,b1,b2], [a0,a1,a2] for b0 s^2 + b1 s + b2
+    Den(s) = s^2 + 2ζωn s + ωn^2
+    low:   Num(s)= ωn^2
+    high:  Num(s)= s^2
+    band:  Num(s)= 2ζωn s
+    notch: Num(s)= s^2 + ωn^2
+    Return num_s, den_s as [b0,b1,b2] for b0 s^2 + b1 s + b2
     """
     den_s = [1.0, 2.0*zeta*wn, wn**2]
 
@@ -144,14 +90,62 @@ def rlc_analog_tf(kind, wn, zeta):
         num_s = [1.0, 0.0, wn**2]
     else:
         raise ValueError("unknown kind")
+
     return num_s, den_s
 
-# ================== System selection ==================
-# band/notch は2次が必要なので、そこだけはRLCに寄せる
-if FILTER_KIND in ["band", "notch"]:
-    system = "RLC"
+def bilinear_biquad_from_analog(num_s, den_s, dt):
+    """
+    Analog: (b0 s^2 + b1 s + b2) / (a0 s^2 + a1 s + a2)
+    Bilinear: s = K*(1 - z^-1)/(1 + z^-1), K=2/dt
+    Returns b=[b0,b1,b2], a=[1,a1,a2] for DF1:
+      y[n] = b0 x[n] + b1 x[n-1] + b2 x[n-2] - a1 y[n-1] - a2 y[n-2]
+    """
+    b0, b1, b2 = map(float, num_s)
+    a0, a1, a2 = map(float, den_s)
+    K = 2.0 / dt
+
+    # (1 - z^-1), (1 + z^-1)
+    p = np.array([1.0, -1.0])
+    q = np.array([1.0,  1.0])
+
+    p2 = np.convolve(p, p)   # (1 - z^-1)^2
+    q2 = np.convolve(q, q)   # (1 + z^-1)^2
+    pq = np.convolve(p, q)   # (1 - z^-1)(1 + z^-1) = 1 - z^-2
+
+    B = (b0 * (K**2)) * p2 + (b1 * K) * pq + b2 * q2
+    A = (a0 * (K**2)) * p2 + (a1 * K) * pq + a2 * q2
+
+    if abs(A[0]) < 1e-18:
+        A[0] = 1e-18
+
+    B = B / A[0]
+    A = A / A[0]
+
+    return B, A  # length-3 each
+
+def biquad_filter(x, b, a):
+    """Direct Form I biquad, a[0]=1 assumed."""
+    y = np.zeros_like(x)
+    b0, b1, b2 = map(float, b)
+    _, a1, a2 = map(float, a)
+
+    x1 = x2 = 0.0
+    y1 = y2 = 0.0
+    for n in range(len(x)):
+        x0 = float(x[n])
+        y0 = b0*x0 + b1*x1 + b2*x2 - a1*y1 - a2*y2
+        y[n] = y0
+        x2, x1 = x1, x0
+        y2, y1 = y1, y0
+    return y
+
+# ================== Random system + random filter-kind by system ==================
+system = rng.choice(["RC", "RL", "RLC"])
+
+if system in ["RC", "RL"]:
+    filter_kind = rng.choice(["low", "high"])
 else:
-    system = rng.choice(["RC", "RL", "RLC"])
+    filter_kind = rng.choice(["low", "high", "band", "notch"])
 
 # ================== Simulate ==================
 if system == "RC":
@@ -160,14 +154,9 @@ if system == "RC":
     tau = R * C
 
     y_lp = first_order_lowpass(x, tau, dt)
-    if FILTER_KIND == "low":
-        y = y_lp
-        fdesc = "lowpass"
-    else:
-        y = x - y_lp
-        fdesc = "highpass"
+    y = y_lp if filter_kind == "low" else (x - y_lp)
 
-    params = f"R={R:.2f}, C={C:.2f}, τ={tau:.2f}, {fdesc}"
+    params = f"R={R:.2f}, C={C:.2f}, τ={tau:.2f}"
 
 elif system == "RL":
     R = float(rng.choice(R_VALUES))
@@ -175,35 +164,24 @@ elif system == "RL":
     tau = L / max(R, 1e-12)
 
     y_lp = first_order_lowpass(x, tau, dt)
-    if FILTER_KIND == "low":
-        y = y_lp
-        fdesc = "lowpass"
-    else:
-        y = x - y_lp
-        fdesc = "highpass"
+    y = y_lp if filter_kind == "low" else (x - y_lp)
 
-    params = f"R={R:.2f}, L={L:.2f}, τ={tau:.2f}, {fdesc}"
+    params = f"R={R:.2f}, L={L:.2f}, τ={tau:.2f}"
 
 else:
-    # 2nd order via analog TF + bilinear transform -> digital biquad
     R = float(rng.choice(R_VALUES))
     L = float(rng.choice(L_VALUES))
     C = float(rng.choice(C_VALUES))
 
     wn = 1.0 / np.sqrt(L * C)
     zeta = (R / 2.0) * np.sqrt(C / L)
+    zeta = max(zeta, 1e-6)  # safety
 
-    # Ensure stable analog (zeta>0). (It always is here.)
-    zeta = max(zeta, 1e-6)
-
-    # Choose actual kind for RLC (all 4 allowed)
-    kind = FILTER_KIND  # low/high/band/notch
-
-    num_s, den_s = rlc_analog_tf(kind, wn, zeta)
+    num_s, den_s = rlc_analog_tf(filter_kind, wn, zeta)
     b, a = bilinear_biquad_from_analog(num_s, den_s, dt)
     y = biquad_filter(x, b, a)
 
-    params = f"R={R:.2f}, L={L:.2f}, C={C:.2f}, ωn={wn:.2f}, ζ={zeta:.2f}, {kind}pass" if kind in ["low","high"] else f"R={R:.2f}, L={L:.2f}, C={C:.2f}, ωn={wn:.2f}, ζ={zeta:.2f}, {kind}"
+    params = f"R={R:.2f}, L={L:.2f}, C={C:.2f}, ωn={wn:.2f}, ζ={zeta:.2f}"
 
 # ================== 1) “Judgement” ==================
 y_center = y - np.mean(y)
@@ -227,7 +205,7 @@ elif score < 0.60:
 else:
     verdict = "feral"
 
-# ================== 2) FFT plot (input + output) ==================
+# ================== 2) FFT plot ==================
 x_center = x - np.mean(x)
 y_center = y - np.mean(y)
 
@@ -239,7 +217,6 @@ freq = np.fft.rfftfreq(len(y_center), d=dt)
 
 magX = np.abs(X)
 magY = np.abs(Y)
-
 magX[0] = 0.0
 magY[0] = 0.0
 
@@ -252,7 +229,7 @@ peak_k = int(np.argmax(magYp))
 peak_f = float(freqp[peak_k])
 peak_mag = float(magYp[peak_k])
 
-# Optional: auto "shape" guess from |Y|/|X|
+# Rough response-shape guess from |Y|/|X|
 eps = 1e-12
 H = magYp / (magXp + eps)
 split = np.median(freqp)
@@ -266,7 +243,7 @@ elif lp_score < 1/1.2:
 else:
     shape_guess = "band/flat-ish"
 
-# ================== 3) English one-liner ==================
+# ================== 3) One-liner ==================
 one_liners = {
     "calm": [
         "Today, the system pretended to be well-behaved.",
@@ -286,7 +263,7 @@ one_liners = {
 }
 line = rng.choice(one_liners[verdict])
 
-# ================== Plot (time + FFT) ==================
+# ================== Plot ==================
 plt.figure(figsize=(9, 7))
 
 ax1 = plt.subplot(2, 1, 1)
@@ -296,7 +273,7 @@ ax1.set_xlabel("t [arb.]")
 ax1.set_ylabel("[arb.]")
 ax1.set_title(
     f"Daily Useless {system} ({today}) | verdict: {verdict}\n"
-    f"Filter: {FILTER_KIND} | Input: {input_kind}, {x_desc} | {params}"
+    f"Filter: {filter_kind} | Input: {input_kind}, {x_desc} | {params}"
 )
 ax1.legend()
 ax1.grid(True, alpha=0.25)
@@ -329,7 +306,7 @@ and excites it with a **random input signal**.
 ## Today's Result ({today})
 
 - **System**: {system}
-- **Filter kind (random)**: {FILTER_KIND}
+- **Filter kind (random by system)**: {filter_kind}
 - **Parameters**: {params}
 - **Input**: {x_desc}
 
