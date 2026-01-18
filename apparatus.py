@@ -132,6 +132,9 @@ mag = np.abs(Y)
 
 # Avoid the DC bin dominating the plot
 mag[0] = 0.0
+mask = freq > 0
+freqp = freq[mask]
+magp = mag[mask]
 peak_k = int(np.argmax(mag))
 peak_f = float(freq[peak_k])
 peak_mag = float(mag[peak_k])
@@ -174,7 +177,9 @@ ax1.grid(True, alpha=0.25)
 
 # Bottom: spectrum
 ax2 = plt.subplot(2, 1, 2)
-ax2.plot(freq, mag)
+ax2.plot(freqp, magp, label="output FFT")
+ax2.set_xscale("log")
+ax2.set_yscale("log")
 ax2.set_xlim(0, min(np.max(freq), 10.0))  # 見やすさ優先で低周波側だけ
 ax2.set_xlabel("frequency [arb.]")
 ax2.set_ylabel("|FFT(output)|")
